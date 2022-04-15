@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"time"
@@ -15,11 +16,55 @@ import (
 	"github.com/gophercloud/gophercloud/pagination"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"gopkg.in/yaml.v2"
 )
 
-// Image examples.
+type osAuthInfos struct {
+	IdentityEndpoint string `yaml:"identity_endpoint"`
+	Username         string `yaml:"username"`
+	Password         string `yaml:"password"`
+	DomainName       string `yaml:"domain_name"`
+	//	TenantName string `yaml: domain_name`
+}
+
+type conf struct {
+	Mode               string      `yaml: mode` // can be projectToS3, projectToProject, s3ToProject
+	ServersName        []string    `yaml: servers_name`
+	ProjectSource      osAuthInfos `yaml:"os_project_source"`
+	ProjectDestination osAuthInfos `yaml:"os_project_destination"`
+}
+
+func (c *conf) getConf(path string) *conf {
+
+	yamlFile, err := ioutil.ReadFile(path)
+	if err != nil {
+		log.Printf("yamlFile.Get err   #%v ", err)
+	}
+	err = yaml.Unmarshal(yamlFile, c)
+	if err != nil {
+		log.Fatalf("Unmarshal: %v", err)
+	}
+
+	return c
+}
+
 func main() {
-	
+
+	// read conf file
+	var c conf
+	c.getConf("./config.yaml")
+	//src
+	fmt.Printf("src_id_endpoint: %s\n", c.ProjectSource.IdentityEndpoint)
+	fmt.Printf("src_username: %s\n", c.ProjectSource.Username)
+	fmt.Printf("src_password: %s\n", c.ProjectSource.Password)
+	fmt.Printf("src_domain: %s\n", c.ProjectSource.DomainName)
+	//dst
+	fmt.Printf("dst_id_endpoint: %s\n", c.ProjectDestination.IdentityEndpoint)
+	fmt.Printf("dst_username: %s\n", c.ProjectDestination.Username)
+	fmt.Printf("dst_password: %s\n", c.ProjectDestination.Password)
+	fmt.Printf("dst_domain: %s\n", c.ProjectDestination.DomainName)
+	return
+
 	// s3
 	endpoint := ""
 	accessKeyID := ""

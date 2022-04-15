@@ -1,10 +1,11 @@
-module github.com/ccleouf66/vm-moover
+module github.com/ccleouf66/vm-mover
 
 go 1.18
 
 require (
 	github.com/gophercloud/gophercloud v0.24.0
 	github.com/minio/minio-go/v7 v7.0.23
+	gopkg.in/yaml.v2 v2.4.0
 )
 
 require (
