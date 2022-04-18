@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"time"
@@ -37,7 +38,16 @@ type conf struct {
 	ServersName        []string    `yaml:"servers_name"`
 	ProjectSource      osAuthInfos `yaml:"os_project_source"`
 	ProjectDestination osAuthInfos `yaml:"os_project_destination"`
-	s3                 s3Conf      `yaml:"s3"`
+	S3                 s3Conf      `yaml:"s3"`
+	WorkerCount        int         `yaml:"worker_count"`
+}
+
+type job struct {
+	OsServer     servers.Server
+	Conf         conf
+	S3Client     *minio.Client
+	ServerClient *gophercloud.ServiceClient
+	ImageClient  *gophercloud.ServiceClient
 }
 
 func (c *conf) getConf(path string) error {
@@ -53,6 +63,18 @@ func (c *conf) getConf(path string) error {
 	return err
 }
 
+func worker(id int, jobs <-chan job, results chan<- int) {
+	for j := range jobs {
+		fmt.Printf("worker %d started job for server %s\n", id, j.OsServer.Name)
+		err := ProcessOpenstackInstance(j.OsServer, j.Conf, j.S3Client, j.ServerClient, j.ImageClient)
+		if err != nil {
+			log.Println(err)
+		}
+		fmt.Printf("worker %d finished job for server %s\n", id, j.OsServer.Name)
+		results <- id
+	}
+}
+
 func main() {
 
 	// read conf file
@@ -62,13 +84,17 @@ func main() {
 		log.Fatalf("Error when reading configuration file :  \n%s\n", err)
 	}
 
-	log.Printf("Running in %s mode", c.Mode)
+	if c.Mode == "projectToS3" || c.Mode == "projectToProject" || c.Mode == "s3ToProject" {
+		log.Printf("Running in %s mode", c.Mode)
+	} else {
+		log.Fatalf("Mode %s not supported.\nAvailable mode : \n projectToS3\n projectToProject\n s3ToProject", c.Mode)
+	}
 
 	//s3
 	var s3Client *minio.Client
 	if c.Mode == "projectToS3" || c.Mode == "s3ToProject" {
-		s3Client, err = minio.New(c.s3.Endpoint, &minio.Options{
-			Creds:  credentials.NewStaticV4(c.s3.AccessKey, c.s3.SecretKey, ""),
+		s3Client, err = minio.New(c.S3.Endpoint, &minio.Options{
+			Creds:  credentials.NewStaticV4(c.S3.AccessKey, c.S3.SecretKey, ""),
 			Secure: true,
 		})
 		if err != nil {
@@ -107,141 +133,189 @@ func main() {
 	}
 	//////////
 
-	// Get server list
-	serverPages := servers.List(serverClient, servers.ListOpts{})
+	if c.Mode == "projectToProject" || c.Mode == "projectToS3" {
 
-	err = serverPages.EachPage(func(page pagination.Page) (bool, error) {
-		serverList, err := servers.ExtractServers(page)
+		// Job queue
+		jobs := make(chan job, len(c.ServersName))
+		results := make(chan int, len(c.ServersName))
 
-		for _, wantedServer := range c.ServersName {
-			found := false
-			for _, osServer := range serverList {
-				if osServer.Name == wantedServer {
-					found = true
-					///////////////////////////////
-					fmt.Printf("Create a new Image from instance %s\n", osServer.Name)
-					imgName := fmt.Sprintf("%s_%s_migration", osServer.Name, time.Now().Local().Format("2006-01-02_15-04-05"))
-					srvImgOpts := servers.CreateImageOpts{
-						Name: imgName,
-						Metadata: map[string]string{
-							"source_instance_id":        osServer.ID,
-							"source_instance_name":      osServer.Name,
-							"source_instance_tenant_id": osServer.TenantID,
-						},
-					}
-					imageID, err := servers.CreateImage(serverClient, osServer.ID, srvImgOpts).ExtractImageID()
-					if err != nil {
-						log.Printf("Err during image creation from instance %s. ERR:\n%s\n", osServer.Name, err)
-						continue
-					}
+		// Define the number of workers working in parallel
+		for w := 1; w <= c.WorkerCount; w++ {
+			go worker(w, jobs, results)
+		}
 
-					// wait image status is ready
-					for {
-						log.Printf("Checking for image status")
+		// Get server list
+		serverPages := servers.List(serverClient, servers.ListOpts{})
 
-						imgListOpts := images.ListOpts{}
-						allPages, err := images.List(imageClient, imgListOpts).AllPages()
-						if err != nil {
-							log.Printf("Err when fetching image informations from instance %s. ERR:\n%s\n", osServer.Name, err)
-							continue
+		err = serverPages.EachPage(func(page pagination.Page) (bool, error) {
+			serverList, err := servers.ExtractServers(page)
+
+			serverCount := 0
+			for _, wantedServer := range c.ServersName {
+				found := false
+				for _, osServer := range serverList {
+					if osServer.Name == wantedServer {
+						found = true
+						///////////////////////////////
+						// For each server create a new job with corresponding infos and push it in the queue
+						///////////////////////////////
+						newJob := job{
+							OsServer:     osServer,
+							Conf:         c,
+							S3Client:     s3Client,
+							ServerClient: serverClient,
+							ImageClient:  imageClient,
 						}
-
-						allImages, err := images.ExtractImages(allPages)
-						if err != nil {
-							log.Printf("Err when fetching image informations from instance %s. ERR:\n%s\n", osServer.Name, err)
-							continue
-						}
-
-						ok := false
-
-						for _, image := range allImages {
-							if image.ID == imageID {
-								fmt.Printf("%s\n", image.Name)
-								fmt.Printf("%s\n", image.Status)
-
-								if image.Status == "active" {
-									ok = true
-								}
-							}
-						}
-
-						if ok {
-							break
-						}
-
-						log.Printf("%s image for instance %s is not yet Active", imageID, osServer.Name)
-						time.Sleep(5 * time.Second)
+						jobs <- newJob
+						serverCount++
+						//////////////////////////////
+						break
 					}
-
-					// Download the instance images
-					image, err := imagedata.Download(imageClient, imageID).Extract()
-					if err != nil {
-						log.Printf("Err during image downloading (img. id: %s) for instance %s. ERR:\n%s\n", imageID, osServer.Name, err)
-						continue
-					}
-					defer image.Close()
-
-					// Create the qcow file
-					// out, err := os.Create(fmt.Sprintf("%s.qcow2", imgName))
-					// if err != nil {
-					// 	log.Printf("Err during image downloading (img. id: %s) for instance %s. ERR:\n%s\n", imageID, s.Name, err)
-					// 	continue
-					// }
-					// defer out.Close()
-					// io.Copy(out, image)
-
-					//
-					// Upload to s3
-					//
-					n, err := s3Client.PutObject(context.Background(), "vm-bk", fmt.Sprintf("%s.qcow2", imgName), image, -1, minio.PutObjectOptions{})
-					if err != nil {
-						log.Fatalln(err)
-					}
-					log.Println("Uploaded", "my-objectname", " of size: ", n, "Successfully.")
-
-					//Get all volume attached to this instance
-					for _, vol := range osServer.AttachedVolumes {
-						fmt.Println(vol.ID)
-					}
-
-					// Uppload volume & instance image to s3
-					visi := images.ImageVisibilityPrivate
-					createOpts := images.CreateOpts{
-						Name:            "kiki-terraform-instance-img-restore",
-						DiskFormat:      "qcow2",
-						ContainerFormat: "bare",
-						Visibility:      &visi,
-					}
-					newImage, err := images.Create(imageClient, createOpts).Extract()
-					if err != nil {
-						panic(err)
-					}
-					reader, err := s3Client.GetObject(context.Background(), "vm-bk", fmt.Sprintf("%s.qcow2", imgName), minio.GetObjectOptions{})
-					if err != nil {
-						log.Fatalln(err)
-					}
-					err = imagedata.Upload(imageClient, newImage.ID, reader).ExtractErr()
-					if err != nil {
-						log.Fatalln(err)
-					}
-					log.Printf("Image create !\n\n")
-					//
-					//////////////////////////////
-					break
+				}
+				if !found {
+					log.Printf("Server %s not found on Openstack.", wantedServer)
 				}
 			}
-			if !found {
-				log.Printf("Server %s not found on Openstack.", wantedServer)
+			close(jobs)
+			for i := 1; i <= serverCount; i++ {
+				<-results
 			}
-		}
+
+			if err != nil {
+				return false, err
+			}
+			return true, nil
+		})
 		if err != nil {
-			return false, err
+			log.Printf("4. %s\n", err)
+			return
 		}
-		return true, nil
-	})
-	if err != nil {
-		log.Printf("4. %s\n", err)
-		return
 	}
 
+}
+
+func CreateImageFromInstance(srv servers.Server, serverClient *gophercloud.ServiceClient) (string, string, error) {
+	fmt.Printf("Create a new Image from instance %s\n", srv.Name)
+	imgName := fmt.Sprintf("%s_%s_migration", srv.Name, time.Now().Local().Format("2006-01-02_15-04-05"))
+	srvImgOpts := servers.CreateImageOpts{
+		Name: imgName,
+		Metadata: map[string]string{
+			"source_instance_id":        srv.ID,
+			"source_instance_name":      srv.Name,
+			"source_instance_tenant_id": srv.TenantID,
+		},
+	}
+	imageID, err := servers.CreateImage(serverClient, srv.ID, srvImgOpts).ExtractImageID()
+	if err != nil {
+		return "", "", err
+	}
+	return imageID, imgName, nil
+}
+
+func WaitImageStatusOk(imageID string, srv servers.Server, imageClient *gophercloud.ServiceClient) error {
+	for {
+		log.Printf("Waiting image status for server %s.", srv.Name)
+
+		imgListOpts := images.ListOpts{
+			ID: imageID,
+		}
+		allPages, err := images.List(imageClient, imgListOpts).AllPages()
+		if err != nil {
+			return err
+		}
+
+		allImages, err := images.ExtractImages(allPages)
+		if err != nil {
+			return err
+		}
+
+		ok := false
+
+		for _, image := range allImages {
+			if image.ID == imageID {
+				if image.Status == "active" {
+					ok = true
+				}
+			}
+		}
+
+		if ok {
+			break
+		}
+
+		//log.Printf("%s image for instance %s is not yet Active", imageID, srv.Name)
+		time.Sleep(5 * time.Second)
+	}
+	return nil
+}
+
+func UploadImageToProject(imageClient *gophercloud.ServiceClient, imageName string, imageReader io.ReadCloser) error {
+	log.Printf("Uploading image %s\n", imageName)
+	visi := images.ImageVisibilityPrivate
+	createOpts := images.CreateOpts{
+		Name:            imageName,
+		DiskFormat:      "qcow2",
+		ContainerFormat: "bare",
+		Visibility:      &visi,
+	}
+	newImage, err := images.Create(imageClient, createOpts).Extract()
+	if err != nil {
+		return err
+	}
+
+	err = imagedata.Upload(imageClient, newImage.ID, imageReader).ExtractErr()
+	if err != nil {
+		return err
+	}
+	log.Printf("Image %s uploaded\n", imageName)
+	return err
+}
+
+func ProcessOpenstackInstance(osServer servers.Server, c conf, s3Client *minio.Client, serverClient *gophercloud.ServiceClient, imageClient *gophercloud.ServiceClient) error {
+	// Create new image from server
+	imageID, imageName, err := CreateImageFromInstance(osServer, serverClient)
+	if err != nil {
+		log.Printf("Error during image creation from instance %s\n", osServer.Name)
+		return err
+	}
+
+	// Wait image status == ready
+	err = WaitImageStatusOk(imageID, osServer, imageClient)
+	if err != nil {
+		log.Printf("Error when fetching image informations from instance %s\n", osServer.Name)
+		return err
+	}
+
+	// Download the instance images
+	imageReader, err := imagedata.Download(imageClient, imageID).Extract()
+	if err != nil {
+		log.Printf("Err during image downloading (img. id: %s) for instance %s\n", imageID, osServer.Name)
+		return err
+	}
+	defer imageReader.Close()
+
+	// Upload to s3
+	if c.Mode == "projectToS3" {
+		n, err := s3Client.PutObject(context.Background(), "vm-bk", fmt.Sprintf("%s.qcow2", imageName), imageReader, -1, minio.PutObjectOptions{})
+		if err != nil {
+			log.Printf("Error during image uploading to s3\n")
+			return err
+		}
+		log.Printf("Uploaded %s of size %s to s3 successfully.", imageName, n.Size)
+	}
+
+	// Upload to other project
+	if c.Mode == "projectToProject" {
+		err = UploadImageToProject(imageClient, imageName, imageReader)
+		if err != nil {
+			log.Printf("Error during image uploading to Openstack project :\n%s", err)
+			return err
+		}
+	}
+
+	//Get all volume attached to this instance
+	for _, vol := range osServer.AttachedVolumes {
+		fmt.Println(vol.ID)
+	}
+	return nil
 }
