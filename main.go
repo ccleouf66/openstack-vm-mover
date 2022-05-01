@@ -44,12 +44,15 @@ type conf struct {
 }
 
 type job struct {
-	OsServer     servers.Server
-	Conf         conf
-	S3Client     *minio.Client
-	ServerClient *gophercloud.ServiceClient
-	ImageClient  *gophercloud.ServiceClient
-	BlockClient  *gophercloud.ServiceClient
+	OsServer        servers.Server
+	Conf            conf
+	S3Client        *minio.Client
+	SrcServerClient *gophercloud.ServiceClient
+	SrcImageClient  *gophercloud.ServiceClient
+	SrcBlockClient  *gophercloud.ServiceClient
+	DstServerClient *gophercloud.ServiceClient
+	DstImageClient  *gophercloud.ServiceClient
+	DstBlockClient  *gophercloud.ServiceClient
 }
 
 func (c *conf) getConf(path string) error {
@@ -68,7 +71,7 @@ func (c *conf) getConf(path string) error {
 func worker(id int, jobs <-chan job, results chan<- int) {
 	for j := range jobs {
 		log.Printf("Worker %d started job for server %s\n", id, j.OsServer.Name)
-		err := ProcessOpenstackInstance(j.OsServer, j.Conf, j.S3Client, j.ServerClient, j.ImageClient, j.BlockClient)
+		err := ProcessOpenstackInstance(j)
 		if err != nil {
 			log.Println(err)
 		}
@@ -105,38 +108,31 @@ func main() {
 	}
 
 	//Openstack src
-	srcOsOpts := gophercloud.AuthOptions{
+	srcOsAuthOpts := gophercloud.AuthOptions{
 		IdentityEndpoint: c.ProjectSource.IdentityEndpoint,
 		Username:         c.ProjectSource.Username,
 		Password:         c.ProjectSource.Password,
 		DomainName:       c.ProjectSource.DomainName,
+		AllowReauth:      true,
 	}
-
-	provider, err := openstack.AuthenticatedClient(srcOsOpts)
+	srcServerClient, srcImageClient, srcBlockClient, err := AuthOpenstack(srcOsAuthOpts, c.ProjectSource.Region)
 	if err != nil {
-		log.Fatalf("Error during Openstack source authentication : \n%s\n", err)
-		return
+		log.Printf("Source Openstack authentication failed.\n")
+		log.Fatalf("%s", err)
 	}
-	srcEndpointOpts := gophercloud.EndpointOpts{
-		Region: c.ProjectSource.Region,
+	//Openstack dst
+	dstOsAuthOpts := gophercloud.AuthOptions{
+		IdentityEndpoint: c.ProjectDestination.IdentityEndpoint,
+		Username:         c.ProjectDestination.Username,
+		Password:         c.ProjectDestination.Password,
+		DomainName:       c.ProjectDestination.DomainName,
+		AllowReauth:      true,
 	}
-
-	// Create server client
-	serverClient, err := openstack.NewComputeV2(provider, srcEndpointOpts)
+	dstServerClient, dstImageClient, dstBlockClient, err := AuthOpenstack(dstOsAuthOpts, c.ProjectDestination.Region)
 	if err != nil {
-		log.Fatalf("Error during Openstack source authentication on compute service : %s\n", err)
+		log.Printf("Destination Openstack authentication failed.\n")
+		log.Fatalf("%s", err)
 	}
-	// Create image client
-	imageClient, err := openstack.NewImageServiceV2(provider, srcEndpointOpts)
-	if err != nil {
-		log.Fatalf("Error during Openstack source authentication on image service: %s\n", err)
-	}
-
-	blockClient, err := openstack.NewBlockStorageV3(provider, srcEndpointOpts)
-	if err != nil {
-		log.Fatalf("Error during Openstack source authentication on blockStorage service: %s\n", err)
-	}
-	//////////
 
 	if c.Mode == "projectToProject" || c.Mode == "projectToS3" {
 
@@ -154,12 +150,11 @@ func main() {
 		}
 
 		// Get server list
-		serverPages := servers.List(serverClient, servers.ListOpts{})
+		serverPages := servers.List(srcServerClient, servers.ListOpts{})
 
 		err = serverPages.EachPage(func(page pagination.Page) (bool, error) {
 			serverList, err := servers.ExtractServers(page)
 
-			serverCount := 0
 			for _, wantedServer := range c.ServersName {
 				found := false
 				for _, osServer := range serverList {
@@ -169,15 +164,18 @@ func main() {
 						// For each server create a new job with corresponding infos and push it in the queue
 						///////////////////////////////
 						newJob := job{
-							OsServer:     osServer,
-							Conf:         c,
-							S3Client:     s3Client,
-							ServerClient: serverClient,
-							ImageClient:  imageClient,
-							BlockClient:  blockClient,
+							OsServer:        osServer,
+							Conf:            c,
+							S3Client:        s3Client,
+							SrcServerClient: srcServerClient,
+							SrcImageClient:  srcImageClient,
+							SrcBlockClient:  srcBlockClient,
+
+							DstServerClient: dstServerClient,
+							DstImageClient:  dstImageClient,
+							DstBlockClient:  dstBlockClient,
 						}
 						jobs <- newJob
-						serverCount++
 						//////////////////////////////
 						break
 					}
@@ -187,7 +185,7 @@ func main() {
 				}
 			}
 			close(jobs)
-			for i := 1; i <= serverCount; i++ {
+			for i := 0; i < len(c.ServersName); i++ {
 				<-results
 			}
 
@@ -202,6 +200,39 @@ func main() {
 		}
 	}
 
+}
+
+func AuthOpenstack(osAuthOptions gophercloud.AuthOptions, region string) (serverClient *gophercloud.ServiceClient, imageClient *gophercloud.ServiceClient, blockClient *gophercloud.ServiceClient, err error) {
+
+	provider, err := openstack.AuthenticatedClient(osAuthOptions)
+	if err != nil {
+		log.Printf("Error during Openstack authentication on Client creation.\n")
+		return nil, nil, nil, err
+	}
+	srcEndpointOpts := gophercloud.EndpointOpts{
+		Region: region,
+	}
+
+	// Create server client
+	serverClient, err = openstack.NewComputeV2(provider, srcEndpointOpts)
+	if err != nil {
+		log.Printf("Error during Openstack authentication on compute service.\n")
+		return nil, nil, nil, err
+	}
+	// Create image client
+	imageClient, err = openstack.NewImageServiceV2(provider, srcEndpointOpts)
+	if err != nil {
+		log.Printf("Error during Openstack authentication on image service.\n")
+		return nil, nil, nil, err
+	}
+
+	blockClient, err = openstack.NewBlockStorageV3(provider, srcEndpointOpts)
+	if err != nil {
+		log.Printf("Error during Openstack authentication on blockStorage service.")
+		return nil, nil, nil, err
+	}
+	return serverClient, imageClient, blockClient, err
+	//////////
 }
 
 func CreateImageFromInstance(srv servers.Server, serverClient *gophercloud.ServiceClient) (string, string, error) {
@@ -262,32 +293,33 @@ func UploadImageToProject(imageClient *gophercloud.ServiceClient, imageName stri
 	return err
 }
 
-func ProcessOpenstackInstance(osServer servers.Server, c conf, s3Client *minio.Client, serverClient *gophercloud.ServiceClient, imageClient *gophercloud.ServiceClient, blockClient *gophercloud.ServiceClient) error {
+func ProcessOpenstackInstance(j job) error {
 	// Create new image from server
-	imageID, imageName, err := CreateImageFromInstance(osServer, serverClient)
+	srcImageID, imageName, err := CreateImageFromInstance(j.OsServer, j.SrcServerClient)
 	if err != nil {
-		log.Printf("Error during image creation from instance %s\n", osServer.Name)
+		log.Printf("Error during image creation from instance %s\n", j.OsServer.Name)
 		return err
 	}
 
 	// Wait image status == ready
-	err = WaitImageStatusOk(imageID, osServer, imageClient)
+	err = WaitImageStatusOk(srcImageID, j.OsServer, j.SrcImageClient)
 	if err != nil {
-		log.Printf("Error when fetching image informations from instance %s\n", osServer.Name)
+		log.Printf("Error when fetching image informations from instance %s\n", j.OsServer.Name)
 		return err
 	}
 
 	// Download the instance images
-	imageReader, err := imagedata.Download(imageClient, imageID).Extract()
+	imageReader, err := imagedata.Download(j.SrcImageClient, srcImageID).Extract()
 	if err != nil {
-		log.Printf("Err during image downloading (img. id: %s) for instance %s\n", imageID, osServer.Name)
+		log.Printf("Err during image downloading (img. id: %s) for instance %s\n", srcImageID, j.OsServer.Name)
 		return err
 	}
 	defer imageReader.Close()
 
 	// Upload to s3
-	if c.Mode == "projectToS3" {
-		n, err := s3Client.PutObject(context.Background(), "vm-bk", fmt.Sprintf("%s.qcow2", imageName), imageReader, -1, minio.PutObjectOptions{})
+	// TO-DO
+	if j.Conf.Mode == "projectToS3" {
+		n, err := j.S3Client.PutObject(context.Background(), "vm-bk", fmt.Sprintf("%s.qcow2", imageName), imageReader, -1, minio.PutObjectOptions{})
 		if err != nil {
 			log.Printf("Error during image uploading to s3\n")
 			return err
@@ -296,8 +328,8 @@ func ProcessOpenstackInstance(osServer servers.Server, c conf, s3Client *minio.C
 	}
 
 	// Upload to other project
-	if c.Mode == "projectToProject" {
-		err = UploadImageToProject(imageClient, imageName, imageReader)
+	if j.Conf.Mode == "projectToProject" {
+		err = UploadImageToProject(j.DstImageClient, imageName, imageReader)
 		if err != nil {
 			log.Printf("Error during image uploading to Openstack project :\n%s", err)
 			return err
@@ -307,14 +339,14 @@ func ProcessOpenstackInstance(osServer servers.Server, c conf, s3Client *minio.C
 	// TODO
 	//
 	//Get all volume attached to this instance
-	for _, vol := range osServer.AttachedVolumes {
-		snapshot, err := snapshots.Create(blockClient, snapshots.CreateOpts{
+	for _, vol := range j.OsServer.AttachedVolumes {
+		snapshot, err := snapshots.Create(j.SrcBlockClient, snapshots.CreateOpts{
 			Name:     fmt.Sprintf("%s_%s", imageName, vol.ID),
 			VolumeID: vol.ID,
 			Force:    true,
 		}).Extract()
 		if err != nil {
-			log.Printf("Error during volume snapshot (vol_id: %s) creation for instance %s", vol.ID, osServer.Name)
+			log.Printf("Error during volume snapshot (vol_id: %s) creation for instance %s", vol.ID, j.OsServer.Name)
 			return err
 		}
 		log.Printf("%s with %s\n", snapshot.ID, snapshot.Status)
