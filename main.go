@@ -10,7 +10,8 @@ import (
 
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack"
-	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/snapshots"
+	"github.com/gophercloud/gophercloud/openstack/blockstorage/extensions/volumetransfers"
+	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/attachments"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
 	"github.com/gophercloud/gophercloud/openstack/imageservice/v2/imagedata"
 	"github.com/gophercloud/gophercloud/openstack/imageservice/v2/images"
@@ -293,6 +294,51 @@ func UploadImageToProject(imageClient *gophercloud.ServiceClient, imageName stri
 	return err
 }
 
+func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.ServiceClient, dstBlockClient *gophercloud.ServiceClient) {
+	//Get all volume attached to this instance
+	for _, vol := range server.AttachedVolumes {
+		//////////////////////////TODO
+		// Snapshot vol only if option is set tot true
+		// snapshot, err := snapshots.Create(j.SrcBlockClient, snapshots.CreateOpts{
+		// 	Name:     fmt.Sprintf("%s_%s", imageName, vol.ID),
+		// 	VolumeID: vol.ID,
+		// 	Force:    true,
+		// }).Extract()
+		// if err != nil {
+		// 	log.Printf("Error during volume snapshot (vol_id: %s) creation for instance %s", vol.ID, j.OsServer.Name)
+		// 	return err
+		// }
+		//////////////////////////
+
+		// Detache
+		err := attachments.Delete(srcBlockClient, vol.ID).ExtractErr()
+		if err != nil {
+			log.Printf("Error during volume detachement for volume %s : \n%s\n", vol.ID, err)
+		}
+
+		// Create the volumeTransfers on source project
+		volumeTransferOpts := volumetransfers.CreateOpts{
+			VolumeID: vol.ID,
+			Name:     fmt.Sprintf("req-%s", vol.ID),
+		}
+
+		reqTransfer, err := volumetransfers.Create(srcBlockClient, volumeTransferOpts).Extract()
+		if err != nil {
+			log.Printf("Error during volumetransfers creation for volume ID %s : \n%s\n", vol.ID, err)
+		}
+
+		// Accept the volumeTransfers on destination project
+		acceptOpts := volumetransfers.AcceptOpts{
+			AuthKey: reqTransfer.AuthKey,
+		}
+
+		transfer, err := volumetransfers.Accept(dstBlockClient, reqTransfer.ID, acceptOpts).Extract()
+		if err != nil {
+			log.Printf("Error when accepting volumetransfers %s for volume ID %s : \n%s\n", transfer.ID, vol.ID, err)
+		}
+	}
+}
+
 func ProcessOpenstackInstance(j job) error {
 	// Create new image from server
 	srcImageID, imageName, err := CreateImageFromInstance(j.OsServer, j.SrcServerClient)
@@ -336,22 +382,5 @@ func ProcessOpenstackInstance(j job) error {
 		}
 	}
 
-	// TODO
-	//
-	//Get all volume attached to this instance
-	for _, vol := range j.OsServer.AttachedVolumes {
-		snapshot, err := snapshots.Create(j.SrcBlockClient, snapshots.CreateOpts{
-			Name:     fmt.Sprintf("%s_%s", imageName, vol.ID),
-			VolumeID: vol.ID,
-			Force:    true,
-		}).Extract()
-		if err != nil {
-			log.Printf("Error during volume snapshot (vol_id: %s) creation for instance %s", vol.ID, j.OsServer.Name)
-			return err
-		}
-		log.Printf("%s with %s\n", snapshot.ID, snapshot.Status)
-		//////////////////////////:
-
-	}
 	return nil
 }
