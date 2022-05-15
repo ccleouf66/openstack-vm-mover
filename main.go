@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -11,7 +12,8 @@ import (
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/extensions/volumetransfers"
-	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/attachments"
+	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/volumeattach"
+	"github.com/gophercloud/gophercloud/openstack/compute/v2/flavors"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
 	"github.com/gophercloud/gophercloud/openstack/imageservice/v2/imagedata"
 	"github.com/gophercloud/gophercloud/openstack/imageservice/v2/images"
@@ -220,6 +222,7 @@ func AuthOpenstack(osAuthOptions gophercloud.AuthOptions, region string) (server
 		log.Printf("Error during Openstack authentication on compute service.\n")
 		return nil, nil, nil, err
 	}
+
 	// Create image client
 	imageClient, err = openstack.NewImageServiceV2(provider, srcEndpointOpts)
 	if err != nil {
@@ -227,11 +230,13 @@ func AuthOpenstack(osAuthOptions gophercloud.AuthOptions, region string) (server
 		return nil, nil, nil, err
 	}
 
+	// Create block client
 	blockClient, err = openstack.NewBlockStorageV3(provider, srcEndpointOpts)
 	if err != nil {
 		log.Printf("Error during Openstack authentication on blockStorage service.")
 		return nil, nil, nil, err
 	}
+	blockClient.Microversion = "3.44"
 	return serverClient, imageClient, blockClient, err
 	//////////
 }
@@ -272,7 +277,7 @@ func WaitImageStatusOk(imageID string, srv servers.Server, imageClient *gophercl
 	return nil
 }
 
-func UploadImageToProject(imageClient *gophercloud.ServiceClient, imageName string, imageReader io.ReadCloser) error {
+func UploadImageToProject(imageClient *gophercloud.ServiceClient, imageName string, imageReader io.ReadCloser) (*images.Image, error) {
 	log.Printf("Uploading image %s\n", imageName)
 	visi := images.ImageVisibilityPrivate
 	createOpts := images.CreateOpts{
@@ -283,20 +288,20 @@ func UploadImageToProject(imageClient *gophercloud.ServiceClient, imageName stri
 	}
 	newImage, err := images.Create(imageClient, createOpts).Extract()
 	if err != nil {
-		return err
+		return newImage, err
 	}
 
 	err = imagedata.Upload(imageClient, newImage.ID, imageReader).ExtractErr()
 	if err != nil {
-		return err
+		return newImage, err
 	}
 	log.Printf("Image %s uploaded\n", imageName)
-	return err
+	return newImage, err
 }
 
-func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.ServiceClient, dstBlockClient *gophercloud.ServiceClient) {
+func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.ServiceClient, srcServerClient *gophercloud.ServiceClient, dstBlockClient *gophercloud.ServiceClient) {
 	//Get all volume attached to this instance
-	for _, vol := range server.AttachedVolumes {
+	for _, attachedVol := range server.AttachedVolumes {
 		//////////////////////////TODO
 		// Snapshot vol only if option is set tot true
 		// snapshot, err := snapshots.Create(j.SrcBlockClient, snapshots.CreateOpts{
@@ -310,22 +315,27 @@ func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.
 		// }
 		//////////////////////////
 
-		// Detache
-		err := attachments.Delete(srcBlockClient, vol.ID).ExtractErr()
+		// Detach the volume
+		err := volumeattach.Delete(srcServerClient, server.ID, attachedVol.ID).ExtractErr()
 		if err != nil {
-			log.Printf("Error during volume detachement for volume %s : \n%s\n", vol.ID, err)
+			log.Printf("Error when delette attachement %s", err)
+			continue
 		}
+
+		//TODO wait volume status = available
 
 		// Create the volumeTransfers on source project
 		volumeTransferOpts := volumetransfers.CreateOpts{
-			VolumeID: vol.ID,
-			Name:     fmt.Sprintf("req-%s", vol.ID),
+			VolumeID: attachedVol.ID,
+			Name:     fmt.Sprintf("req-%s", attachedVol.ID),
 		}
 
 		reqTransfer, err := volumetransfers.Create(srcBlockClient, volumeTransferOpts).Extract()
 		if err != nil {
-			log.Printf("Error during volumetransfers creation for volume ID %s : \n%s\n", vol.ID, err)
+			log.Printf("Error during volumetransfers creation for volume ID %s : \n%s\n", attachedVol.ID, err)
+			continue
 		}
+		log.Printf("Volume transfer request %s created for volume %s", reqTransfer.ID, attachedVol.ID)
 
 		// Accept the volumeTransfers on destination project
 		acceptOpts := volumetransfers.AcceptOpts{
@@ -334,12 +344,14 @@ func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.
 
 		transfer, err := volumetransfers.Accept(dstBlockClient, reqTransfer.ID, acceptOpts).Extract()
 		if err != nil {
-			log.Printf("Error when accepting volumetransfers %s for volume ID %s : \n%s\n", transfer.ID, vol.ID, err)
+			log.Printf("Error when accepting volumetransfers %s for volume ID %s : \n%s\n", transfer.ID, attachedVol.ID, err)
 		}
+		log.Printf("Volume transfer request %s accepted for volume %s", reqTransfer.ID, attachedVol.ID)
 	}
 }
 
 func ProcessOpenstackInstance(j job) error {
+
 	// Create new image from server
 	srcImageID, imageName, err := CreateImageFromInstance(j.OsServer, j.SrcServerClient)
 	if err != nil {
@@ -375,11 +387,43 @@ func ProcessOpenstackInstance(j job) error {
 
 	// Upload to other project
 	if j.Conf.Mode == "projectToProject" {
-		err = UploadImageToProject(j.DstImageClient, imageName, imageReader)
+		destImage, err := UploadImageToProject(j.DstImageClient, imageName, imageReader)
 		if err != nil {
 			log.Printf("Error during image uploading to Openstack project :\n%s", err)
 			return err
 		}
+
+		// Detach and transfer block volume from source to dest projet
+		TransferVolumeToProject(j.OsServer, j.SrcBlockClient, j.SrcServerClient, j.DstBlockClient)
+
+		// Create new server on dest project with exported image
+		jsonFlavor, err := json.Marshal(j.OsServer.Flavor)
+		if err != nil {
+			log.Printf("Error when getting flavor infos for instance %s\n", j.OsServer.Name)
+			return err
+		}
+		srcFlavor := flavors.Flavor{}
+		err = srcFlavor.UnmarshalJSON(jsonFlavor)
+		if err != nil {
+			log.Printf("Error when descoding flavor infos for instance %s\n", j.OsServer.Name)
+			return err
+		}
+		createOpts := servers.CreateOpts{
+			Name:      j.OsServer.Name,
+			ImageRef:  destImage.ID,
+			FlavorRef: srcFlavor.ID,
+			Networks: []servers.Network{
+				{UUID: "581fad02-158d-4dc6-81f0-c1ec2794bbec"},
+			},
+		}
+
+		dstServer, err := servers.Create(j.DstServerClient, createOpts).Extract()
+		if err != nil {
+			log.Printf("Error when creating new instance on destination project for instance %s\n", j.OsServer.Name)
+			return err
+		}
+		log.Printf("New server %s created on destination project\n", dstServer.Name)
+
 	}
 
 	return nil
