@@ -12,6 +12,7 @@ import (
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/extensions/volumetransfers"
+	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/volumes"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/volumeattach"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/flavors"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
@@ -318,11 +319,16 @@ func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.
 		// Detach the volume
 		err := volumeattach.Delete(srcServerClient, server.ID, attachedVol.ID).ExtractErr()
 		if err != nil {
-			log.Printf("Error when delette attachement %s", err)
+			log.Printf("Error when delette attachement for volume ID %s : \n%s\n", attachedVol.ID, err)
 			continue
 		}
 
-		//TODO wait volume status = available
+		// Wait volume status = available (not attached or in-use)
+		err = WaitVolumeAvailable(srcBlockClient, attachedVol.ID)
+		if err != nil {
+			log.Printf("Error when fetching volume status for volume ID %s : \n%s\n", attachedVol.ID, err)
+			continue
+		}
 
 		// Create the volumeTransfers on source project
 		volumeTransferOpts := volumetransfers.CreateOpts{
@@ -335,7 +341,7 @@ func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.
 			log.Printf("Error during volumetransfers creation for volume ID %s : \n%s\n", attachedVol.ID, err)
 			continue
 		}
-		log.Printf("Volume transfer request %s created for volume %s", reqTransfer.ID, attachedVol.ID)
+		log.Printf("Volume transfer request %s created for volume %s\n", reqTransfer.ID, attachedVol.ID)
 
 		// Accept the volumeTransfers on destination project
 		acceptOpts := volumetransfers.AcceptOpts{
@@ -346,7 +352,22 @@ func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.
 		if err != nil {
 			log.Printf("Error when accepting volumetransfers %s for volume ID %s : \n%s\n", transfer.ID, attachedVol.ID, err)
 		}
-		log.Printf("Volume transfer request %s accepted for volume %s", reqTransfer.ID, attachedVol.ID)
+		log.Printf("Volume transfer request %s accepted for volume %s\n", reqTransfer.ID, attachedVol.ID)
+	}
+}
+
+func WaitVolumeAvailable(srcBlockClient *gophercloud.ServiceClient, volID string) error {
+	log.Printf("Waiting block volume %s to be available.", volID)
+	for {
+		vol, err := volumes.Get(srcBlockClient, volID).Extract()
+		if err != nil {
+			return nil
+		}
+		if vol.Status == "available" {
+			log.Printf("Volume %s -> %s.", volID, vol.Status)
+			return nil
+		}
+		time.Sleep(10 * time.Second)
 	}
 }
 
@@ -405,7 +426,7 @@ func ProcessOpenstackInstance(j job) error {
 		srcFlavor := flavors.Flavor{}
 		err = srcFlavor.UnmarshalJSON(jsonFlavor)
 		if err != nil {
-			log.Printf("Error when descoding flavor infos for instance %s\n", j.OsServer.Name)
+			log.Printf("Error when decoding flavor infos for instance %s\n", j.OsServer.Name)
 			return err
 		}
 		createOpts := servers.CreateOpts{
