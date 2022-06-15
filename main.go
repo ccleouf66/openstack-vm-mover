@@ -260,26 +260,24 @@ func CreateImageFromInstance(srv servers.Server, serverClient *gophercloud.Servi
 	return imageID, imgName, nil
 }
 
-func WaitImageStatusOk(imageID string, srv servers.Server, imageClient *gophercloud.ServiceClient) error {
-	log.Printf("Waiting image status for server %s.", srv.Name)
+func WaitImageStatusOk(imageClient *gophercloud.ServiceClient, imageID string) error {
+	log.Printf("Waiting image status for image %s\n", imageID)
 	for {
 		image, err := images.Get(imageClient, imageID).Extract()
 		if err != nil {
 			return err
 		}
 		if image.Status == "active" {
-			log.Printf("Image status is %s for server %s.", image.Status, srv.Name)
+			log.Printf("Image %s have status %s\n", imageID, image.Status)
 			break
 		}
-
-		//log.Printf("%s image for instance %s is not yet Active", imageID, srv.Name)
 		time.Sleep(10 * time.Second)
 	}
 	return nil
 }
 
 func UploadImageToProject(imageClient *gophercloud.ServiceClient, imageName string, imageReader io.ReadCloser) (*images.Image, error) {
-	log.Printf("Uploading image %s\n", imageName)
+	log.Printf("Uploading image %s to image store of destination project\n", imageName)
 	visi := images.ImageVisibilityPrivate
 	createOpts := images.CreateOpts{
 		Name:            imageName,
@@ -333,6 +331,7 @@ func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.
 		vols = append(vols, *volInfos)
 
 		// Detach the volume
+		log.Printf("Detach volume %s (%s) from server %s\n", volInfos.Name, volInfos.ID, server.ID)
 		err = volumeattach.Delete(srcServerClient, server.ID, attachedVol.ID).ExtractErr()
 		if err != nil {
 			log.Printf("Error when delette attachement for volume ID %s : \n%s\n", attachedVol.ID, err)
@@ -352,23 +351,25 @@ func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.
 			Name:     fmt.Sprintf("req-%s", attachedVol.ID),
 		}
 
+		log.Printf("Create volume transfer for voluem %s (%s)", volInfos.Name, attachedVol.ID)
 		reqTransfer, err := volumetransfers.Create(srcBlockClient, volumeTransferOpts).Extract()
 		if err != nil {
 			log.Printf("Error during volumetransfers creation for volume ID %s : \n%s\n", attachedVol.ID, err)
 			continue
 		}
-		log.Printf("Volume transfer request %s created for volume %s\n", reqTransfer.ID, attachedVol.ID)
+		log.Printf("Volume transfer %s created for volume %s (%s)\n", reqTransfer.ID, volInfos.Name, attachedVol.ID)
 
 		// Accept the volumeTransfers on destination project
 		acceptOpts := volumetransfers.AcceptOpts{
 			AuthKey: reqTransfer.AuthKey,
 		}
 
+		log.Printf("Accept volume transfer %s on destination project for volume %s (%s)", reqTransfer.ID, volInfos.Name, attachedVol.ID)
 		transfer, err := volumetransfers.Accept(dstBlockClient, reqTransfer.ID, acceptOpts).Extract()
 		if err != nil {
-			log.Printf("Error when accepting volumetransfers %s for volume ID %s : \n%s\n", transfer.ID, attachedVol.ID, err)
+			log.Printf("Error when accepting volume transfer %s for volume %s (%s) : \n%s\n", transfer.ID, volInfos.Name, attachedVol.ID, err)
 		}
-		log.Printf("Volume transfer request %s accepted for volume %s\n", reqTransfer.ID, attachedVol.ID)
+		log.Printf("Volume %s (%s) transfered on destination project\n", volInfos.Name, attachedVol.ID)
 	}
 	return vols
 }
@@ -398,7 +399,7 @@ func ProcessOpenstackInstance(j job) error {
 	}
 
 	// Wait image status == ready
-	err = WaitImageStatusOk(srcImageID, j.OsServer, j.SrcImageClient)
+	err = WaitImageStatusOk(j.SrcImageClient, srcImageID)
 	if err != nil {
 		log.Printf("Error when fetching image informations from instance %s\n", j.OsServer.Name)
 		return err
@@ -427,7 +428,7 @@ func ProcessOpenstackInstance(j job) error {
 	if j.Conf.Mode == "projectToProject" {
 		destImage, err := UploadImageToProject(j.DstImageClient, imageName, imageReader)
 		if err != nil {
-			log.Printf("Error during image uploading to Openstack project :\n%s", err)
+			log.Printf("Error during image uploading to Openstack project : %s\n", err)
 			return err
 		}
 
@@ -435,15 +436,16 @@ func ProcessOpenstackInstance(j job) error {
 		srcVols := TransferVolumeToProject(j.OsServer, j.SrcBlockClient, j.SrcServerClient, j.DstBlockClient)
 
 		// Create new server on dest project with exported image
+		log.Printf("Create new server on destination project using %s (%s) image\n", destImage.Name, destImage.ID)
 		jsonFlavor, err := json.Marshal(j.OsServer.Flavor)
 		if err != nil {
-			log.Printf("Error when getting flavor infos for instance %s\n", j.OsServer.Name)
+			log.Printf("Error when getting flavor infos for instance %s : %s\n", j.OsServer.Name, err)
 			return err
 		}
 		srcFlavor := flavors.Flavor{}
 		err = srcFlavor.UnmarshalJSON(jsonFlavor)
 		if err != nil {
-			log.Printf("Error when decoding flavor infos for instance %s\n", j.OsServer.Name)
+			log.Printf("Error when decoding flavor infos for instance %s : %s \n", j.OsServer.Name, err)
 			return err
 		}
 		createOpts := servers.CreateOpts{
@@ -457,14 +459,22 @@ func ProcessOpenstackInstance(j job) error {
 
 		dstServer, err := servers.Create(j.DstServerClient, createOpts).Extract()
 		if err != nil {
-			log.Printf("Error when creating new instance on destination project for instance %s\n", j.OsServer.Name)
+			log.Printf("Error when creating new instance on destination project for instance %s : %s\n", j.OsServer.Name, err)
 			return err
 		}
+		// Wait server status = ACTIVE
 		err = servers.WaitForStatus(j.DstServerClient, dstServer.ID, "ACTIVE", 180)
 		if err != nil {
-			log.Printf("Error when getting server status for server %s (%s)\n", dstServer.Name, dstServer.ID)
+			log.Printf("Error when getting server status for server %s (%s) : %s\n", dstServer.Name, dstServer.ID, err)
+			return err
 		}
-		log.Printf("New server %s (%s) created on destination project, status : %s\n", dstServer.Name, dstServer.ID, dstServer.Status)
+		// Get new server infos
+		server, err := servers.Get(j.DstServerClient, dstServer.ID).Extract()
+		if err != nil {
+			log.Printf("Error when getting server infos for server ID %s : %s\n", dstServer.ID, err)
+			return err
+		}
+		log.Printf("New server %s (%s) created on destination project, status : %s\n", server.Name, server.ID, server.Status)
 
 		// Attach transfered block volumes on new instance
 		for _, vol := range srcVols {
@@ -480,10 +490,9 @@ func ProcessOpenstackInstance(j job) error {
 				log.Printf("Error when attaching block volume to new instance on destination project for volume %s on instance %s :\n%s\n", vol.ID, j.OsServer.Name, err)
 				continue
 			}
-			log.Printf("Volume %s attached to server %s with attachement id %s on %s\n", vol.ID, dstServer.Name, attachement.ID, attachement.Device)
+			log.Printf("Volume %s (%s) attached to server %s with attachement id %s on %s\n", vol.Name, vol.ID, server.Name, attachement.ID, attachement.Device)
 		}
 
 	}
-
-	return nil
+	return err
 }
