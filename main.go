@@ -300,7 +300,9 @@ func UploadImageToProject(imageClient *gophercloud.ServiceClient, imageName stri
 	return newImage, err
 }
 
-func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.ServiceClient, srcServerClient *gophercloud.ServiceClient, dstBlockClient *gophercloud.ServiceClient) {
+func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.ServiceClient, srcServerClient *gophercloud.ServiceClient, dstBlockClient *gophercloud.ServiceClient) []volumes.Volume {
+	var vols []volumes.Volume
+
 	//Get all volume attached to this instance
 	for _, attachedVol := range server.AttachedVolumes {
 		//////////////////////////TODO
@@ -316,8 +318,22 @@ func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.
 		// }
 		//////////////////////////
 
+		// Get Volume attachement infos to retrive the device name (ex: /dev/sdb)
+		volInfos, err := volumes.Get(srcBlockClient, attachedVol.ID).Extract()
+		if err != nil {
+			log.Printf("Error when fetching volume and volume attachement infos for volume ID %s : \n%s\n", attachedVol.ID, err)
+			continue
+		}
+
+		// Vol not attached (not possible) or multi attachement volume
+		if len(volInfos.Attachments) != 1 {
+			log.Printf("Error when fetching volume and volume attachement infos : this volume is mounted %d time, volume ID %s : \n%s\n", len(volInfos.Attachments), attachedVol.ID, err)
+			continue
+		}
+		vols = append(vols, *volInfos)
+
 		// Detach the volume
-		err := volumeattach.Delete(srcServerClient, server.ID, attachedVol.ID).ExtractErr()
+		err = volumeattach.Delete(srcServerClient, server.ID, attachedVol.ID).ExtractErr()
 		if err != nil {
 			log.Printf("Error when delette attachement for volume ID %s : \n%s\n", attachedVol.ID, err)
 			continue
@@ -354,6 +370,7 @@ func TransferVolumeToProject(server servers.Server, srcBlockClient *gophercloud.
 		}
 		log.Printf("Volume transfer request %s accepted for volume %s\n", reqTransfer.ID, attachedVol.ID)
 	}
+	return vols
 }
 
 func WaitVolumeAvailable(srcBlockClient *gophercloud.ServiceClient, volID string) error {
@@ -415,7 +432,7 @@ func ProcessOpenstackInstance(j job) error {
 		}
 
 		// Detach and transfer block volume from source to dest projet
-		TransferVolumeToProject(j.OsServer, j.SrcBlockClient, j.SrcServerClient, j.DstBlockClient)
+		srcVols := TransferVolumeToProject(j.OsServer, j.SrcBlockClient, j.SrcServerClient, j.DstBlockClient)
 
 		// Create new server on dest project with exported image
 		jsonFlavor, err := json.Marshal(j.OsServer.Flavor)
@@ -443,7 +460,28 @@ func ProcessOpenstackInstance(j job) error {
 			log.Printf("Error when creating new instance on destination project for instance %s\n", j.OsServer.Name)
 			return err
 		}
-		log.Printf("New server %s created on destination project\n", dstServer.Name)
+		err = servers.WaitForStatus(j.DstServerClient, dstServer.ID, "ACTIVE", 180)
+		if err != nil {
+			log.Printf("Error when getting server status for server %s (%s)\n", dstServer.Name, dstServer.ID)
+		}
+		log.Printf("New server %s (%s) created on destination project, status : %s\n", dstServer.Name, dstServer.ID, dstServer.Status)
+
+		// Attach transfered block volumes on new instance
+		for _, vol := range srcVols {
+
+			// Create volume attachement object with device name
+			createOpts := volumeattach.CreateOpts{
+				Device:   vol.Attachments[0].Device,
+				VolumeID: vol.ID,
+			}
+
+			attachement, err := volumeattach.Create(j.DstServerClient, dstServer.ID, createOpts).Extract()
+			if err != nil {
+				log.Printf("Error when attaching block volume to new instance on destination project for volume %s on instance %s :\n%s\n", vol.ID, j.OsServer.Name, err)
+				continue
+			}
+			log.Printf("Volume %s attached to server %s with attachement id %s on %s\n", vol.ID, dstServer.Name, attachement.ID, attachement.Device)
+		}
 
 	}
 
