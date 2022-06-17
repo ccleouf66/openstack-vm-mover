@@ -38,9 +38,20 @@ type s3Conf struct {
 	SecretKey string `yaml:"secret_key"`
 }
 
+type network struct {
+	UUID    string `yaml:"UUID"`
+	Port    string `yaml:"port"`
+	FixedIP string `yaml:"fixedIP"`
+}
+
+type server struct {
+	Name     string    `yaml:"name"`
+	Networks []network `yaml:"networks"`
+}
+
 type conf struct {
 	Mode               string      `yaml:"mode"` // can be projectToS3, projectToProject, s3ToProject
-	ServersName        []string    `yaml:"servers_name"`
+	Servers            []server    `yaml:"servers"`
 	ProjectSource      osAuthInfos `yaml:"os_project_source"`
 	ProjectDestination osAuthInfos `yaml:"os_project_destination"`
 	S3                 s3Conf      `yaml:"s3"`
@@ -48,8 +59,8 @@ type conf struct {
 }
 
 type job struct {
-	OsServer        servers.Server
-	Conf            conf
+	OsServer        servers.Server // the server to migrate
+	Conf            conf           // the configuration related for this server, project source & project destination credentials for exemple
 	S3Client        *minio.Client
 	SrcServerClient *gophercloud.ServiceClient
 	SrcImageClient  *gophercloud.ServiceClient
@@ -144,8 +155,8 @@ func main() {
 			log.Fatalf("Worker count = %d, did you define the 'worker_count' var in the config.yaml file ?\n", c.WorkerCount)
 		}
 		// Job queue
-		jobs := make(chan job, len(c.ServersName))
-		results := make(chan int, len(c.ServersName))
+		jobs := make(chan job, len(c.Servers))
+		results := make(chan int, len(c.Servers))
 
 		// Define the number of workers working in parallel
 		log.Printf("Creating %d workers\n", c.WorkerCount)
@@ -159,10 +170,10 @@ func main() {
 		err = serverPages.EachPage(func(page pagination.Page) (bool, error) {
 			serverList, err := servers.ExtractServers(page)
 
-			for _, wantedServer := range c.ServersName {
+			for _, wantedServer := range c.Servers {
 				found := false
 				for _, osServer := range serverList {
-					if osServer.Name == wantedServer {
+					if osServer.Name == wantedServer.Name {
 						found = true
 						///////////////////////////////
 						// For each server create a new job with corresponding infos and push it in the queue
@@ -189,7 +200,7 @@ func main() {
 				}
 			}
 			close(jobs)
-			for i := 0; i < len(c.ServersName); i++ {
+			for i := 0; i < len(c.Servers); i++ {
 				<-results
 			}
 
@@ -199,7 +210,7 @@ func main() {
 			return true, nil
 		})
 		if err != nil {
-			log.Printf("4. %s\n", err)
+			log.Printf("Error when getting the server list on Openstack: %s\n", err)
 			return
 		}
 	}
@@ -437,6 +448,7 @@ func ProcessOpenstackInstance(j job) error {
 
 		// Create new server on dest project with exported image
 		log.Printf("Create new server on destination project using %s (%s) image\n", destImage.Name, destImage.ID)
+		// Get flavor name from src instance
 		jsonFlavor, err := json.Marshal(j.OsServer.Flavor)
 		if err != nil {
 			log.Printf("Error when getting flavor infos for instance %s : %s\n", j.OsServer.Name, err)
@@ -448,13 +460,26 @@ func ProcessOpenstackInstance(j job) error {
 			log.Printf("Error when decoding flavor infos for instance %s : %s \n", j.OsServer.Name, err)
 			return err
 		}
+		// Get Network config from config file
+		var netConf []servers.Network
+		for _, srvConf := range j.Conf.Servers {
+			if srvConf.Name == j.OsServer.Name {
+				for _, nic := range srvConf.Networks {
+					netConf = append(netConf, servers.Network{
+						UUID:    nic.UUID,
+						Port:    nic.Port,
+						FixedIP: nic.FixedIP,
+					})
+				}
+				break
+			}
+		}
+		// Set new instance config
 		createOpts := servers.CreateOpts{
 			Name:      j.OsServer.Name,
 			ImageRef:  destImage.ID,
 			FlavorRef: srcFlavor.ID,
-			Networks: []servers.Network{
-				{UUID: "581fad02-158d-4dc6-81f0-c1ec2794bbec"},
-			},
+			Networks:  netConf,
 		}
 
 		dstServer, err := servers.Create(j.DstServerClient, createOpts).Extract()
