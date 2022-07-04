@@ -25,6 +25,9 @@ servers:
       - UUID: "581fad02-158d-4dc6-81f0-c1ec2794bbec"  # OVHcloud EXT-NET network UUID
       - UUID: "fde034ed-1482-4eb2-ae2c-d305c68cc56b"
         fixedIP: "10.119.128.152"
+    security_groups:
+      - test-kiki
+    stop_vm: true           # Stop the source VM, prevent errors while detaching volumes on source instance
 
 os_project_source:
   identity_endpoint: https://auth.cloud.ovh.net/v3

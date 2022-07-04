@@ -13,6 +13,7 @@ import (
 	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/extensions/volumetransfers"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/volumes"
+	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/startstop"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/volumeattach"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/flavors"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
@@ -48,6 +49,7 @@ type server struct {
 	Name           string    `yaml:"name"`
 	Networks       []network `yaml:"networks"`
 	SecurityGroups []string  `yaml:"security_groups"`
+	StopServer     bool      `yaml:"stop_vm"`
 }
 
 type conf struct {
@@ -404,6 +406,25 @@ func WaitVolumeAvailable(srcBlockClient *gophercloud.ServiceClient, volID string
 }
 
 func ProcessOpenstackInstance(j job) error {
+
+	// Stop the server if flag in the conf is set to true
+	if j.ServerConfDest.StopServer && j.OsServer.Status == "ACTIVE" {
+		err := startstop.Stop(j.SrcServerClient, j.OsServer.ID).ExtractErr()
+		if err != nil {
+			log.Printf("Error when trying to stop instance %s\n", j.OsServer.Name)
+			return err
+		}
+	} else if !j.ServerConfDest.StopServer && j.OsServer.Status == "ACTIVE" {
+		log.Printf("Warning the server %s will not be stopped before instance snapshot and volume transfer actions, this can cause issue on the source VM when the volumes will be detached.\n", j.OsServer.Name)
+	}
+
+	// Wait server status = SHUTOFF
+	err := servers.WaitForStatus(j.SrcServerClient, j.OsServer.ID, "SHUTOFF", 300)
+	if err != nil {
+		log.Printf("Error when getting server status for server %s (%s) : %s\n", j.OsServer.Name, j.OsServer.ID, err)
+		return err
+	}
+	// Get new server infos
 
 	// Create new image from server
 	srcImageID, imageName, err := CreateImageFromInstance(j.OsServer, j.SrcServerClient)
