@@ -45,8 +45,9 @@ type network struct {
 }
 
 type server struct {
-	Name     string    `yaml:"name"`
-	Networks []network `yaml:"networks"`
+	Name           string    `yaml:"name"`
+	Networks       []network `yaml:"networks"`
+	SecurityGroups []string  `yaml:"security_groups"`
 }
 
 type conf struct {
@@ -61,6 +62,7 @@ type conf struct {
 type job struct {
 	OsServer        servers.Server // the server to migrate
 	Conf            conf           // the configuration related for this server, project source & project destination credentials for exemple
+	ServerConfDest  server
 	S3Client        *minio.Client
 	SrcServerClient *gophercloud.ServiceClient
 	SrcImageClient  *gophercloud.ServiceClient
@@ -181,6 +183,7 @@ func main() {
 						newJob := job{
 							OsServer:        osServer,
 							Conf:            c,
+							ServerConfDest:  wantedServer,
 							S3Client:        s3Client,
 							SrcServerClient: srcServerClient,
 							SrcImageClient:  srcImageClient,
@@ -462,24 +465,21 @@ func ProcessOpenstackInstance(j job) error {
 		}
 		// Get Network config from config file
 		var netConf []servers.Network
-		for _, srvConf := range j.Conf.Servers {
-			if srvConf.Name == j.OsServer.Name {
-				for _, nic := range srvConf.Networks {
-					netConf = append(netConf, servers.Network{
-						UUID:    nic.UUID,
-						Port:    nic.Port,
-						FixedIP: nic.FixedIP,
-					})
-				}
-				break
-			}
+		for _, nic := range j.ServerConfDest.Networks {
+			netConf = append(netConf, servers.Network{
+				UUID:    nic.UUID,
+				Port:    nic.Port,
+				FixedIP: nic.FixedIP,
+			})
 		}
+
 		// Set new instance config
 		createOpts := servers.CreateOpts{
-			Name:      j.OsServer.Name,
-			ImageRef:  destImage.ID,
-			FlavorRef: srcFlavor.ID,
-			Networks:  netConf,
+			Name:           j.OsServer.Name,
+			ImageRef:       destImage.ID,
+			FlavorRef:      srcFlavor.ID,
+			Networks:       netConf,
+			SecurityGroups: j.ServerConfDest.SecurityGroups,
 		}
 
 		dstServer, err := servers.Create(j.DstServerClient, createOpts).Extract()
@@ -488,7 +488,7 @@ func ProcessOpenstackInstance(j job) error {
 			return err
 		}
 		// Wait server status = ACTIVE
-		err = servers.WaitForStatus(j.DstServerClient, dstServer.ID, "ACTIVE", 180)
+		err = servers.WaitForStatus(j.DstServerClient, dstServer.ID, "ACTIVE", 300)
 		if err != nil {
 			log.Printf("Error when getting server status for server %s (%s) : %s\n", dstServer.Name, dstServer.ID, err)
 			return err
