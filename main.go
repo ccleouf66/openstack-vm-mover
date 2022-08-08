@@ -424,7 +424,6 @@ func ProcessOpenstackInstance(j job) error {
 		log.Printf("Error when getting server status for server %s (%s) : %s\n", j.OsServer.Name, j.OsServer.ID, err)
 		return err
 	}
-	// Get new server infos
 
 	// Create new image from server
 	srcImageID, imageName, err := CreateImageFromInstance(j.OsServer, j.SrcServerClient)
@@ -464,6 +463,14 @@ func ProcessOpenstackInstance(j job) error {
 		destImage, err := UploadImageToProject(j.DstImageClient, imageName, imageReader)
 		if err != nil {
 			log.Printf("Error during image uploading to Openstack project : %s\n", err)
+			return err
+		}
+
+		// Remove source image on the source project
+		log.Printf("Delete source image %s (%s) on source project.\n", imageName, srcImageID)
+		err = images.Delete(j.SrcImageClient, srcImageID).ExtractErr()
+		if err != nil {
+			log.Printf("Error when deleting source image %s (%s) on source project : %s\n", imageName, srcImageID, err)
 			return err
 		}
 
@@ -521,6 +528,14 @@ func ProcessOpenstackInstance(j job) error {
 			return err
 		}
 		log.Printf("New server %s (%s) created on destination project, status : %s\n", server.Name, server.ID, server.Status)
+
+		// Remove image on the dest project
+		log.Printf("Delete image %s (%s) on destination project.\n", destImage.Name, destImage.ID)
+		err = images.Delete(j.DstImageClient, destImage.ID).ExtractErr()
+		if err != nil {
+			log.Printf("Error when deleting image %s (%s) on dest project : %s\n", destImage.Name, destImage.ID, err)
+			return err
+		}
 
 		// Attach transfered block volumes on new instance
 		for _, vol := range srcVols {
